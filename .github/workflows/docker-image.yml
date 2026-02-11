@@ -29,7 +29,7 @@ jobs:
       - name: Set up Node.js (LTS recommended)
         uses: actions/setup-node@v4
         with:
-          node-version: '23'   # LTS
+          node-version: '23'
 
       - name: Frontend Compilation (Syntax Check)
         run: |
@@ -72,20 +72,26 @@ jobs:
           severity: CRITICAL,HIGH
 
   # -----------------------------
-  # 4️⃣ Build & Push Backend Docker Image to ECR
+  # 4️⃣ Build & Push Backend Docker Image to ECR + Scan
   # -----------------------------
   build_backend_docker_image_and_push:
     runs-on: ubuntu-latest
     needs: trivy_fs_scan
     steps:
       - uses: actions/checkout@v4
-      - uses: aws-actions/configure-aws-credentials@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::286119371104:role/devsecops-role
           aws-region: ${{ env.AWS_REGION }}
           audience: sts.amazonaws.com
-      - uses: aws-actions/amazon-ecr-login@v2
-      - uses: docker/build-push-action@v6
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & Push Backend Image
+        uses: docker/build-push-action@v6
         with:
           context: ./api
           file: ./api/Dockerfile
@@ -94,40 +100,8 @@ jobs:
             286119371104.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_BACKEND }}:latest
             286119371104.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_BACKEND }}:${{ env.IMAGE_TAG }}
 
-  # -----------------------------
-  # 5️⃣ Build & Push Frontend Docker Image to ECR
-  # -----------------------------
-  build_frontend_docker_image_and_push:
-    runs-on: ubuntu-latest
-    needs: trivy_fs_scan
-    steps:
-      - uses: actions/checkout@v4
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::286119371104:role/devsecops-role
-          aws-region: ${{ env.AWS_REGION }}
-          audience: sts.amazonaws.com
-      - uses: aws-actions/amazon-ecr-login@v2
-      - uses: docker/build-push-action@v6
-        with:
-          context: ./client
-          file: ./client/Dockerfile
-          push: true
-          tags: |
-            286119371104.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_FRONTEND }}:latest
-            286119371104.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_FRONTEND }}:${{ env.IMAGE_TAG }}
-
-  # -----------------------------
-  # 6️⃣ Trivy Image Scan
-  # -----------------------------
-  trivy_image_scan:
-    runs-on: ubuntu-latest
-    needs:
-      - build_backend_docker_image_and_push
-      - build_frontend_docker_image_and_push
-    steps:
-      - uses: actions/checkout@v4
-      - uses: aquasecurity/trivy-action@0.28.0
+      - name: Trivy Scan Backend Image
+        uses: aquasecurity/trivy-action@0.28.0
         with:
           scan-type: image
           image-ref: 286119371104.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_BACKEND }}:${{ env.IMAGE_TAG }}
@@ -136,7 +110,38 @@ jobs:
           ignore-unfixed: true
           vuln-type: os,library
           severity: CRITICAL,HIGH
-      - uses: aquasecurity/trivy-action@0.28.0
+
+  # -----------------------------
+  # 5️⃣ Build & Push Frontend Docker Image to ECR + Scan
+  # -----------------------------
+  build_frontend_docker_image_and_push:
+    runs-on: ubuntu-latest
+    needs: trivy_fs_scan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::286119371104:role/devsecops-role
+          aws-region: ${{ env.AWS_REGION }}
+          audience: sts.amazonaws.com
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & Push Frontend Image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./client
+          file: ./client/Dockerfile
+          push: true
+          tags: |
+            286119371104.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_FRONTEND }}:latest
+            286119371104.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_FRONTEND }}:${{ env.IMAGE_TAG }}
+
+      - name: Trivy Scan Frontend Image
+        uses: aquasecurity/trivy-action@0.28.0
         with:
           scan-type: image
           image-ref: 286119371104.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_FRONTEND }}:${{ env.IMAGE_TAG }}
@@ -147,11 +152,13 @@ jobs:
           severity: CRITICAL,HIGH
 
   # -----------------------------
-  # 7️⃣ Update CD Repo (GitOps)
+  # 6️⃣ Update CD Repo (GitOps)
   # -----------------------------
   update_cd_repo:
     runs-on: ubuntu-latest
-    needs: trivy_image_scan
+    needs:
+      - build_backend_docker_image_and_push
+      - build_frontend_docker_image_and_push
     steps:
       - uses: actions/checkout@v4
         with:
@@ -159,14 +166,18 @@ jobs:
           ref: main
           token: ${{ secrets.CD_REPO_TOKEN }}
           path: cd
+
       - run: |
           curl -sL https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o yq
           sudo install yq /usr/local/bin/yq
+
       - working-directory: cd
         run: |
+          # Remove accidental Service .spec.template
           yq -i '(. | select(.kind=="Service")) |= del(.spec.template)' k8s-prod/backend.yaml
           yq -i '(. | select(.kind=="Service")) |= del(.spec.template)' k8s-prod/frontend.yaml
 
+          # Update backend image
           yq -i '
             (. | select(.kind=="Deployment")
                | .spec.template.spec.containers[]
@@ -175,6 +186,7 @@ jobs:
             = "286119371104.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY_BACKEND }}:" + strenv(IMAGE_TAG)
           ' k8s-prod/backend.yaml
 
+          # Update frontend image
           yq -i '
             (. | select(.kind=="Deployment")
                | .spec.template.spec.containers[]
