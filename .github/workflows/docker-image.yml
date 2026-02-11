@@ -1,4 +1,4 @@
-name: Node.js CI + ECR Build & Push
+name: Node.js CI + ECR Build & Push + GitOps CD
 
 on:
   push:
@@ -7,8 +7,8 @@ on:
     branches: [ main ]
 
 permissions:
-  id-token: write       # required for OIDC → AWS
-  contents: write       # required to push to CD repo
+  id-token: write       # OIDC → AWS
+  contents: write       # CD repo updates
 
 env:
   AWS_REGION: ap-south-1
@@ -17,10 +17,13 @@ env:
   IMAGE_TAG: ${{ github.sha }}
 
 jobs:
-  compile:
+  # -----------------------------
+  # 1️⃣ Node.js Lint / Syntax Check
+  # -----------------------------
+  lint:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Checkout Code
         uses: actions/checkout@v4
 
       - name: Set up Node.js
@@ -28,19 +31,24 @@ jobs:
         with:
           node-version: '18'
 
-      - name: Frontend Syntax Check
+      - name: Frontend Lint
         run: |
           cd client
-          find . -name "*.js" -exec node --check {} +
+          npm install
+          npx eslint . --ext .js,.jsx
 
-      - name: Backend Syntax Check
+      - name: Backend Lint
         run: |
           cd api
-          find . -name "*.js" -exec node --check {} +
+          npm install
+          npx eslint . --ext .js,.jsx
 
+  # -----------------------------
+  # 2️⃣ Gitleaks Secret Scan
+  # -----------------------------
   gitleaks-scan:
     runs-on: ubuntu-latest
-    needs: compile
+    needs: lint
     steps:
       - uses: actions/checkout@v4
       - uses: gitleaks/gitleaks-action@v2
@@ -48,6 +56,9 @@ jobs:
           gitleaks detect --source ./client --exit-code 1
           gitleaks detect --source ./api --exit-code 1
 
+  # -----------------------------
+  # 3️⃣ Trivy Filesystem Scan
+  # -----------------------------
   trivy_fs_scan:
     runs-on: ubuntu-latest
     needs: gitleaks-scan
@@ -62,6 +73,9 @@ jobs:
           vuln-type: os,library
           severity: CRITICAL,HIGH
 
+  # -----------------------------
+  # 4️⃣ Build & Push Backend Docker Image to ECR
+  # -----------------------------
   build_backend_docker_image_and_push:
     runs-on: ubuntu-latest
     needs: trivy_fs_scan
@@ -78,7 +92,7 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build & Push Backend Docker Image
+      - name: Build & Push Backend Image
         uses: docker/build-push-action@v6
         with:
           context: ./api
@@ -88,6 +102,9 @@ jobs:
             286119371104.dkr.ecr.$AWS_REGION.amazonaws.com/${{ env.ECR_REPOSITORY_BACKEND }}:latest
             286119371104.dkr.ecr.$AWS_REGION.amazonaws.com/${{ env.ECR_REPOSITORY_BACKEND }}:${{ env.IMAGE_TAG }}
 
+  # -----------------------------
+  # 5️⃣ Build & Push Frontend Docker Image to ECR
+  # -----------------------------
   build_frontend_docker_image_and_push:
     runs-on: ubuntu-latest
     needs: trivy_fs_scan
@@ -104,7 +121,7 @@ jobs:
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build & Push Frontend Docker Image
+      - name: Build & Push Frontend Image
         uses: docker/build-push-action@v6
         with:
           context: ./client
@@ -114,6 +131,9 @@ jobs:
             286119371104.dkr.ecr.$AWS_REGION.amazonaws.com/${{ env.ECR_REPOSITORY_FRONTEND }}:latest
             286119371104.dkr.ecr.$AWS_REGION.amazonaws.com/${{ env.ECR_REPOSITORY_FRONTEND }}:${{ env.IMAGE_TAG }}
 
+  # -----------------------------
+  # 6️⃣ Trivy Image Scan
+  # -----------------------------
   trivy_image_scan:
     runs-on: ubuntu-latest
     needs:
@@ -144,6 +164,9 @@ jobs:
           vuln-type: os,library
           severity: CRITICAL,HIGH
 
+  # -----------------------------
+  # 7️⃣ Update CD Repo (GitOps)
+  # -----------------------------
   update_cd_repo:
     runs-on: ubuntu-latest
     needs: trivy_image_scan
@@ -151,21 +174,26 @@ jobs:
       - name: Checkout CD repo
         uses: actions/checkout@v4
         with:
-          repository: jaiswaladi246/3-Tier-GitOps-CD
+          repository: vishnukrajan007/3-Tier-GitOps-CD
           ref: main
           token: ${{ secrets.CD_REPO_TOKEN }}
           path: cd
 
-      - name: Bump images in manifests
+      - name: Install yq
+        run: |
+          curl -sL https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o yq
+          sudo install yq /usr/local/bin/yq
+
+      - name: Update Deployment images
         working-directory: cd
         env:
           IMAGE_TAG: ${{ env.IMAGE_TAG }}
         run: |
-          curl -sL https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64 -o yq && sudo install yq /usr/local/bin/yq
-
+          # Remove accidental Service .spec.template
           yq -i '(. | select(.kind=="Service")) |= del(.spec.template)' k8s-prod/backend.yaml
           yq -i '(. | select(.kind=="Service")) |= del(.spec.template)' k8s-prod/frontend.yaml
 
+          # Update backend image
           yq -i '
             (. | select(.kind=="Deployment")
                | .spec.template.spec.containers[]
@@ -174,6 +202,7 @@ jobs:
             = "286119371104.dkr.ecr.$AWS_REGION.amazonaws.com/${{ env.ECR_REPOSITORY_BACKEND }}:" + strenv(IMAGE_TAG)
           ' k8s-prod/backend.yaml
 
+          # Update frontend image
           yq -i '
             (. | select(.kind=="Deployment")
                | .spec.template.spec.containers[]
@@ -182,7 +211,7 @@ jobs:
             = "286119371104.dkr.ecr.$AWS_REGION.amazonaws.com/${{ env.ECR_REPOSITORY_FRONTEND }}:" + strenv(IMAGE_TAG)
           ' k8s-prod/frontend.yaml
 
-      - name: Commit & push to CD repo
+      - name: Commit & Push CD updates
         working-directory: cd
         run: |
           git config user.name "ci-bot"
